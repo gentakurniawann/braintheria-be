@@ -6,7 +6,7 @@ import { QuestionsModule } from './questions/questions.module';
 import { AnswersModule } from './answers/answers.module';
 import { LedgerModule } from './ledger/ledger.module';
 import { BountiesModule } from './bounties/bounties.module';
-import { WebhookModule } from './webhook/webhook.module';
+// import { WebhookModule } from './webhook/webhook.module';
 import { InternalModule } from './internal/internal.module';
 import { SseModule } from './sse/sse.module';
 import { ChainModule } from './chain/chain.module';
@@ -25,7 +25,7 @@ import { HashingModule } from './hashing/hashing.module';
     AnswersModule,
     LedgerModule,
     BountiesModule,
-    WebhookModule,
+    // WebhookModule,
     InternalModule,
     SseModule,
     ChainModule,
