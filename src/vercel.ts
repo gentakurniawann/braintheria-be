@@ -1,74 +1,109 @@
 // src/vercel.ts
 import 'reflect-metadata';
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cookieParser from 'cookie-parser';
 import passport from 'passport';
-import cookieSession from 'cookie-session'; // stateless, serverless-friendly
+import cookieSession from 'cookie-session';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { ExpressAdapter } from '@nestjs/platform-express';
 import serverless from 'serverless-http';
 
-// If you prefer express-session with a store (e.g. Upstash/Redis), see note below.
 const SESSION_NAME = process.env.SESSION_NAME || 'sid';
-const SESSION_SECRET = process.env.SESSION_SECRET || process.env.JWT_SECRET || 'dev';
+const SESSION_SECRET =
+  process.env.SESSION_SECRET || process.env.JWT_SECRET || 'dev';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+const IS_PROD = process.env.NODE_ENV === 'production';
 
-let cachedServer: any;
+let cachedServer: ReturnType<typeof serverless> | null = null;
+
+// simple fast health endpoint (before Nest) to verify the lambda returns
+function mountPreNestRoutes(app: express.Express) {
+  app.get('/__health', (_req, res) => {
+    res.json({ ok: true, ts: Date.now() });
+  });
+
+  // Avoid long-lived connections on Serverless — short-circuit SSE here.
+  app.get('/sse/stream', (_req, res) => {
+    res.status(501).json({
+      error: 'SSE not supported on Serverless function. Move to Edge or a VM.',
+    });
+  });
+}
+
+function corsMiddleware(req: Request, res: Response, next: NextFunction) {
+  res.setHeader('Access-Control-Allow-Origin', FRONTEND_URL);
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Origin, X-Requested-With, Content-Type, Accept, Authorization',
+  );
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'GET,POST,PATCH,PUT,DELETE,OPTIONS',
+  );
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+}
 
 async function bootstrapServer() {
   const expressApp = express();
 
-  // 1) Cookies
-  expressApp.use(cookieParser());
+  // behind Vercel proxy – needed for proper secure cookie behavior
+  expressApp.set('trust proxy', 1);
 
-  // 2) Session (serverless-safe): cookie-session keeps state in a signed cookie
-  //    If you need server-side sessions, use express-session + Redis (see note).
+  // Pre-Nest fast routes
+  mountPreNestRoutes(expressApp);
+
+  // Cookies + session (stateless cookie-based session for serverless)
+  expressApp.use(cookieParser());
   expressApp.use(
     cookieSession({
       name: SESSION_NAME,
       secret: SESSION_SECRET,
-      // security flags – adjust for your domain/https
       httpOnly: true,
       sameSite: 'lax',
-      secure: false, // set true when you’re on https domain
+      secure: IS_PROD, // true on https domain
       maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     }),
   );
 
-  // 3) Passport
+  // Passport
   expressApp.use(passport.initialize());
-  // With cookie-session there is no server store, but Passport will still call serialize/deserialize.
   expressApp.use(passport.session());
 
-  // 4) CORS (mirror your main.ts)
-  //    NOTE: Vercel proxy often adds its own headers; keep this simple.
-  expressApp.use((req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', FRONTEND_URL);
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader(
-      'Access-Control-Allow-Headers',
-      'Origin, X-Requested-With, Content-Type, Accept, Authorization',
-    );
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,PUT,DELETE,OPTIONS');
-    if (req.method === 'OPTIONS') return res.sendStatus(204);
-    next();
-  });
+  // CORS (fast preflight)
+  expressApp.use(corsMiddleware);
 
-  // 5) Create Nest app on the express adapter (no listen(), only init)
+  // NOTE: Nest will add its own body parsers; no need to add express.json() here
   const adapter = new ExpressAdapter(expressApp);
   const app = await NestFactory.create(AppModule, adapter, {
     logger: ['error', 'warn', 'log'],
   });
-  await app.init(); // IMPORTANT on serverless
 
-  // Convert to a lambda-style handler
+  // If you have global pipes/filters, set them here
+  // app.useGlobalPipes(new ValidationPipe({ whitelist: true }));
+
+  await app.init(); // IMPORTANT: do NOT call app.listen()
+
+  // Wrap Express in a lambda handler
   return serverless(expressApp, {
-    // config options if needed
+    // Keep default; adding callbacks here rarely helps with timeouts
   });
 }
 
 export default async function handler(req: Request, res: Response) {
-  if (!cachedServer) cachedServer = await bootstrapServer();
-  return cachedServer(req, res);
+  try {
+    if (!cachedServer) {
+      cachedServer = await bootstrapServer();
+    }
+
+    // Return/await the promise so Vercel knows when to finish the request
+    return await cachedServer(req, res);
+  } catch (err) {
+    console.error('[vercel handler error]', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  }
 }
