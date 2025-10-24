@@ -7,9 +7,13 @@ export class UpdateQuestionDto {
 
   @IsOptional()
   @IsString()
-  body?: string;
+  bodyMd?: string;
+
+  @IsOptional()
+  @IsString()
+  bounty?: string;
 
   @IsOptional()
   @IsNumber()
-  bounty?: number;
+  id?: number;
 }

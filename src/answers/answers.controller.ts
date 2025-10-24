@@ -53,7 +53,7 @@ export class AnswersController {
       where: { questionId: qId },
       orderBy: { createdAt: 'desc' },
       include: {
-        author: { select: { id: true, email: true, primaryWallet: true } },
+        author: { select: { id: true, name: true, primaryWallet: true } },
       },
     });
 

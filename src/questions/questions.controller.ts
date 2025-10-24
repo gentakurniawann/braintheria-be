@@ -13,6 +13,7 @@ import {
   ForbiddenException,
   NotFoundException,
   ParseIntPipe,
+  Req,
 } from '@nestjs/common';
 import { QuestionsService } from './questions.service';
 import { AskDto } from '../dto/ask.dto';
@@ -80,18 +81,24 @@ export class QuestionsController {
   }
 
   @Get()
+  @UseGuards(JwtAuthGuard)
   async list(
     @Query('page') page = 1,
     @Query('limit') limit = 10,
-    @Query('status') status?: string, // optional filter
+    @Query('status') status?: string,
+    @Query('search') search?: string,
+    @Req() req?: Request,
   ) {
     const pageNumber = Number(page);
     const limitNumber = Number(limit);
+    const userId = (req as any)?.user?.id || (req as any)?.user?.sub;
 
     return this.svc.list({
       page: pageNumber,
       limit: limitNumber,
       status,
+      search,
+      tokenUserId: userId || null,
     });
   }
 
@@ -102,8 +109,9 @@ export class QuestionsController {
 
   @Get(':id')
   @UseGuards(JwtAuthGuard)
-  getById(@Param('id') id: string) {
-    return this.svc.getById(Number(id));
+  async getById(@Param('id') id: string, @Req() req?: Request) {
+    const userId = (req as any)?.user?.id || (req as any)?.user?.sub;
+    return this.svc.getById(Number(id), userId);
   }
 
   @Patch(':id')

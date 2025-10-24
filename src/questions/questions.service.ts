@@ -110,12 +110,15 @@ export class QuestionsService {
     return { ...updated, bountyWei: bountyOnChain };
   }
 
-  async getById(id: number) {
+  async getById(id: number, tokenUserId?: number) {
     const q = await this.prisma.question.findUnique({
       where: { id },
       include: {
         answers: {
           select: { id: true, authorId: true, isBest: true, contentHash: true },
+        },
+        author: {
+          select: { id: true, name: true, primaryWallet: true },
         },
       },
     });
@@ -127,7 +130,12 @@ export class QuestionsService {
       bountyWei = (await this.chainRead.bountyOf(q.chainQId)).toString();
     }
 
-    return { ...q, bountyWei, bestAId };
+    return {
+      ...q,
+      bountyWei,
+      bestAId,
+      isAuthor: tokenUserId === q.authorId, // Add isAuthor here
+    };
   }
 
   async list(params?: {
@@ -135,15 +143,19 @@ export class QuestionsService {
     page?: number;
     limit?: number;
     status?: string;
+    search?: string;
+    tokenUserId?: number;
   }) {
     const page = params?.page ?? 1;
     const limit = params?.limit ?? 10;
     const where: any = {};
 
-    // Filter by user if provided
-    if (params?.userId) where.authorId = params.userId;
+    // Filter by authorId
+    if (params?.userId) {
+      where.authorId = params.userId;
+    }
 
-    // Filter by status if valid
+    // Filter by status
     if (
       params?.status &&
       ['Open', 'Verified', 'Cancelled'].includes(params.status)
@@ -151,6 +163,15 @@ export class QuestionsService {
       where.status = params.status;
     }
 
+    // Search by search (in title or body)
+    if (params?.search) {
+      where.OR = [
+        { title: { contains: params.search, mode: 'insensitive' } },
+        { bodyMd: { contains: params.search, mode: 'insensitive' } },
+      ];
+    }
+
+    // Fetch data and count
     const [data, total] = await this.prisma.$transaction([
       this.prisma.question.findMany({
         where,
@@ -159,15 +180,21 @@ export class QuestionsService {
         orderBy: { createdAt: 'desc' },
         include: {
           author: {
-            select: { id: true, email: true, primaryWallet: true },
+            select: { id: true, name: true, primaryWallet: true },
           },
         },
       }),
       this.prisma.question.count({ where }),
     ]);
 
+    // Add isAuthor field per question
+    const processedData = data.map((q) => ({
+      ...q,
+      isAuthor: params?.tokenUserId === q.authorId,
+    }));
+
     return {
-      data,
+      data: processedData,
       meta: {
         total,
         page,
@@ -175,6 +202,7 @@ export class QuestionsService {
         totalPages: Math.ceil(total / limit),
         filter: params?.status ?? 'All',
         userScoped: !!params?.userId,
+        search: params?.search ?? null,
       },
     };
   }
@@ -194,18 +222,69 @@ export class QuestionsService {
   async update(id: number, dto: UpdateQuestionDto) {
     const question = await this.prisma.question.findUnique({ where: { id } });
     if (!question) throw new NotFoundException('Question not found.');
-    if (question.status !== 'Open') {
+    if (question.status !== 'Open')
       throw new BadRequestException('Only open questions can be edited.');
+
+    const updateData: any = {
+      updatedAt: new Date(),
+    };
+
+    // Update title & body if provided
+    if (dto.title !== undefined) updateData.title = dto.title;
+    if (dto.bodyMd !== undefined) updateData.bodyMd = dto.bodyMd;
+
+    // === BOUNTY HANDLING ===
+    if (dto.bounty !== undefined) {
+      const newBountyEth = parseFloat(dto.bounty);
+      const newBountyWei = BigInt(Math.floor(newBountyEth * 1e18));
+      const oldBountyWei = BigInt(question.bountyAmountWei || '0');
+
+      if (newBountyWei > oldBountyWei) {
+        // 🟢 Increase bounty on-chain
+        const addWei = newBountyWei - oldBountyWei;
+        if (!question.chainQId)
+          throw new BadRequestException('Question not yet on-chain.');
+
+        await this.signerService.fundMore(Number(question.chainQId), addWei);
+
+        updateData.bountyAmountWei = newBountyWei.toString();
+      } else if (newBountyWei < oldBountyWei) {
+        // 🔴 Reduce bounty on-chain
+        const reduceWei = oldBountyWei - newBountyWei;
+        if (!question.chainQId)
+          throw new BadRequestException('Question not yet on-chain.');
+
+        await this.signerService.reduceBounty(
+          Number(question.chainQId),
+          reduceWei,
+        );
+
+        updateData.bountyAmountWei = newBountyWei.toString();
+      }
     }
 
-    // Only text/content edit here. Bounty edits use separate endpoints below.
-    return this.prisma.question.update({
+    const updated = await this.prisma.question.update({
       where: { id },
-      data: {
-        ...dto,
-        updatedAt: new Date(),
-      },
+      data: updateData,
     });
+
+    // 🔄 Refresh live bounty from chain if question is on-chain
+    if (updated.chainQId != null) {
+      try {
+        const bountyOnChain = await this.signerService.contract.bountyOf(
+          updated.chainQId,
+        );
+        updated.bountyAmountWei = bountyOnChain.toString();
+      } catch (error) {
+        // Log error but don't fail the update
+        console.warn(
+          `Failed to fetch bounty for chainQId ${updated.chainQId}:`,
+          error.message,
+        );
+      }
+    }
+
+    return updated;
   }
 
   async addBounty(id: number, addEth: number) {
@@ -308,7 +387,7 @@ export class QuestionsService {
     const closed = await this.prisma.question.update({
       where: { id },
       data: {
-        status: 'Closed',
+        status: 'Cancelled',
         updatedAt: new Date(),
       },
     });
@@ -353,7 +432,6 @@ export class QuestionsService {
     if (!question.chainQId || !answer.chainAId)
       throw new BadRequestException('No on-chain IDs found');
 
-  
     const txReceipt = await this.signerService.rewardUser(
       question.chainQId,
       answer.chainAId,

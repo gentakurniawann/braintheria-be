@@ -118,9 +118,12 @@ export class SignerService {
   }
 
   async fundMore(chainQId: number, addWei: bigint) {
-    const tx = await this.contract.fundMore(chainQId, addWei, {
+    // Call the contract's addBounty function instead of fundMore
+    const tx = await this.contract.addBounty(chainQId, addWei, {
       value: addWei,
     });
+
+    // Wait for transaction confirmation
     return await tx.wait();
   }
 
